@@ -4,7 +4,7 @@ import subprocess
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
-from scipy.signal import iirnotch, filtfilt
+from scipy.signal import iirnotch, sosfiltfilt, tf2sos
 from adsShm import ShmReader
 
 _BINARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adc_oscilloscope")
@@ -20,8 +20,11 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self.shm_reader = None
         self._buf  = collections.deque(maxlen=self.DISPLAY_SAMPLES)
         self._proc = None
-        self._abs_raw_min = None
-        self._abs_raw_max = None
+        self._abs_raw_min  = None
+        self._abs_raw_max  = None
+        self._gain_offsets = {}   # {gain_reg: offset_volts}
+        self._notch_sos   = None
+        self._notch_fs    = None
 
         self.setWindowTitle("ADS1263 Oscilloscope")
         self.setGeometry(100, 100, 900, 600)
@@ -146,6 +149,19 @@ class Oscilloscope(QtWidgets.QMainWindow):
         abs_clear_btn = QtWidgets.QPushButton("Abs Clear")
         abs_clear_btn.clicked.connect(self._clear_abs)
         ctrl_row2.addWidget(abs_clear_btn)
+
+        ctrl_row2.addSpacing(12)
+        self.zero_btn = QtWidgets.QPushButton("Zero")
+        self.zero_btn.setToolTip("Capture mean of current window as offset for the active gain")
+        self.zero_btn.clicked.connect(self._on_zero)
+        ctrl_row2.addWidget(self.zero_btn)
+        zero_clr_btn = QtWidgets.QPushButton("Clr Zero")
+        zero_clr_btn.setToolTip("Clear offset for the active gain")
+        zero_clr_btn.clicked.connect(self._on_zero_clear)
+        ctrl_row2.addWidget(zero_clr_btn)
+        self.zero_label = QtWidgets.QLabel("")
+        self.zero_label.setFixedWidth(90)
+        ctrl_row2.addWidget(self.zero_label)
 
         ctrl_row2.addStretch()
 
@@ -589,10 +605,23 @@ class Oscilloscope(QtWidgets.QMainWindow):
                 self.pair0_plot.setXRange(0, window_s, padding=0)
                 if self._buf:
                     data = np.array(self._buf, dtype=np.float32)
+                    gain_reg = self.gain_combo.currentData()
+                    gain_off = self._gain_offsets.get(gain_reg, 0.0)
+                    if gain_off != 0.0:
+                        data = data - np.float32(gain_off)
                     if self.notch_50hz_chk.isChecked() and sample_rate > 100:
-                        b, a = iirnotch(50.0, 30.0, float(sample_rate))
-                        if len(data) > 3 * max(len(b), len(a)):
-                            data = filtfilt(b, a, data).astype(np.float32)
+                        if self._notch_fs != sample_rate:
+                            b, a = iirnotch(50.0, 30.0, float(sample_rate))
+                            self._notch_sos = tf2sos(b, a)
+                            self._notch_fs  = sample_rate
+                        if self._notch_sos is not None and len(data) > 9:
+                            try:
+                                data = sosfiltfilt(
+                                    self._notch_sos,
+                                    data.astype(np.float64)
+                                ).astype(np.float32)
+                            except Exception:
+                                pass
                     t = (np.arange(len(data)) + (self._buf.maxlen - len(data))) / sample_rate
                     self.pair0_curve.setData(t, data)
 
@@ -769,6 +798,24 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self._abs_raw_max = None
         if not self.lsb_chk.isChecked():
             self.lsb_label.setText("—")
+
+    def _on_zero(self):
+        if not self._buf:
+            return
+        gain_reg = self.gain_combo.currentData()
+        off = float(np.mean(np.array(self._buf, dtype=np.float64)))
+        self._gain_offsets[gain_reg] = off
+        if abs(off) < 1e-3:
+            self.zero_label.setText(f"{off*1e6:.2f} µV")
+        elif abs(off) < 1.0:
+            self.zero_label.setText(f"{off*1e3:.4f} mV")
+        else:
+            self.zero_label.setText(f"{off:.6f} V")
+
+    def _on_zero_clear(self):
+        gain_reg = self.gain_combo.currentData()
+        self._gain_offsets.pop(gain_reg, None)
+        self.zero_label.setText("")
 
     def _clear(self):
         self._buf.clear()
