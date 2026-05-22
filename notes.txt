@@ -1,0 +1,341 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sched.h>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+#include <gpiod.h>
+#include <linux/spi/spidev.h>
+#include "ads1263.h"
+
+// ── Hardware config ──────────────────────────────────────
+#define SPI_DEV       "/dev/spidev0.0"
+#define SPI_HZ        1000000    // 1MHz — safe for ADS1263
+#define GPIO_CHIP     "/dev/gpiochip4"
+#define PIN_DRDY      17         // GPIO BCM17 — connect to DRDY
+#define PIN_RESET     27         // GPIO BCM27 — connect to RESET
+
+// ── Acquisition config ───────────────────────────────────
+#define SAMPLE_RATE   1000       // 1kHz per channel
+#define VREF          2.5f       // internal reference
+#define ADC_DR        DR_2400    // 2400 SPS → enough for 2×1kHz mux
+
+// ── Globals ──────────────────────────────────────────────
+static int        spi_fd   = -1;
+static AdsShm    *shm      = NULL;
+static volatile int running = 1;
+
+static struct gpiod_chip *chip      = NULL;
+static struct gpiod_line *drdy_line = NULL;
+static struct gpiod_line *rst_line  = NULL;
+
+// ── Signal handler ───────────────────────────────────────
+static void sig_handler(int s) {
+    (void)s;
+    running = 0;
+}
+
+// ── RT setup ────────────────────────────────────────────
+static void setup_rt(void) {
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(3, &cpuset);
+    pthread_setaffinity_np(pthread_self(),
+                           sizeof(cpuset), &cpuset);
+
+    struct sched_param sp = { .sched_priority = 90 };
+    sched_setscheduler(0, SCHED_FIFO, &sp);
+
+    // Suppress C-state latency
+    int lat_fd = open("/dev/cpu_dma_latency", O_WRONLY);
+    if (lat_fd >= 0) {
+        static int32_t zero = 0;
+        write(lat_fd, &zero, sizeof(zero));
+    }
+}
+
+// ── SPI helpers ──────────────────────────────────────────
+static void spi_transfer(uint8_t *tx, uint8_t *rx, int len) {
+    struct spi_ioc_transfer tr = {
+        .tx_buf        = (unsigned long)tx,
+        .rx_buf        = (unsigned long)rx,
+        .len           = len,
+        .speed_hz      = SPI_HZ,
+        .bits_per_word = 8,
+        .delay_usecs   = 0,
+    };
+    ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+}
+
+static void spi_cmd(uint8_t cmd) {
+    uint8_t tx = cmd, rx = 0;
+    spi_transfer(&tx, &rx, 1);
+}
+
+static void write_reg(uint8_t reg, uint8_t val) {
+    uint8_t tx[3] = {
+        (uint8_t)(ADS1263_CMD_WREG | reg),
+        0x00,   // write 1 register
+        val
+    };
+    uint8_t rx[3] = {0};
+    spi_transfer(tx, rx, 3);
+}
+
+static uint8_t read_reg(uint8_t reg) {
+    uint8_t tx[3] = {
+        (uint8_t)(ADS1263_CMD_RREG | reg),
+        0x00,
+        0x00
+    };
+    uint8_t rx[3] = {0};
+    spi_transfer(tx, rx, 3);
+    return rx[2];
+}
+
+// ── ADS1263 init ─────────────────────────────────────────
+static int ads1263_init(void) {
+    // Hardware reset
+    gpiod_line_set_value(rst_line, 0);
+    usleep(200);
+    gpiod_line_set_value(rst_line, 1);
+    usleep(5000);   // wait for boot
+
+    // Software reset
+    spi_cmd(ADS1263_CMD_RESET);
+    usleep(5000);
+
+    // Verify chip ID
+    uint8_t id = read_reg(REG_ID);
+    printf("ADS1263 ID: 0x%02x (expect 0x23)\n", id);
+    if ((id & 0xE0) != 0x20) {
+        fprintf(stderr, "ADS1263 not found!\n");
+        return -1;
+    }
+
+    // POWER: internal reference ON
+    write_reg(REG_POWER, 0x11);   // INTREF=1, VBIAS=0
+
+    // INTERFACE: timeout disabled, checksum off for speed
+    write_reg(REG_INTERFACE, 0x04); // STATUS byte enabled
+
+    // MODE0: continuous conversion, no chop/delay
+    write_reg(REG_MODE0, 0x00);
+
+    // MODE1: sinc4 filter, default
+    write_reg(REG_MODE1, 0x80);
+
+    // MODE2: GAIN=1, DR=2400SPS
+    write_reg(REG_MODE2, GAIN_1 | ADC_DR);
+
+    // REFMUX: use internal 2.5V reference
+    write_reg(REG_REFMUX, 0x00);
+
+    // Start with CH0
+    write_reg(REG_INPMUX, MUX_CH0_AINCOM);
+
+    // START conversion
+    spi_cmd(ADS1263_CMD_START1);
+    usleep(1000);
+
+    printf("ADS1263 initialized, DR=2400SPS\n");
+    return 0;
+}
+
+// ── Read one 32-bit conversion result ────────────────────
+// Returns raw signed 32-bit value
+static int32_t ads1263_read(void) {
+    // RDATA1 command + read 5 bytes: status + 4 data bytes
+    uint8_t tx[6] = { ADS1263_CMD_RDATA1, 0, 0, 0, 0, 0 };
+    uint8_t rx[6] = { 0 };
+    spi_transfer(tx, rx, 6);
+
+    // rx[0] = dummy (cmd echo)
+    // rx[1] = status byte
+    // rx[2..5] = 32-bit result MSB first
+    int32_t raw = (int32_t)(
+        ((uint32_t)rx[2] << 24) |
+        ((uint32_t)rx[3] << 16) |
+        ((uint32_t)rx[4] <<  8) |
+        ((uint32_t)rx[5])
+    );
+    return raw;
+}
+
+// ── Wait for DRDY with timeout ────────────────────────────
+static int wait_drdy(int timeout_ms) {
+    struct gpiod_line_event evt;
+    struct timespec ts = {
+        .tv_sec  = timeout_ms / 1000,
+        .tv_nsec = (timeout_ms % 1000) * 1000000L,
+    };
+    return gpiod_line_event_wait(drdy_line, &ts);
+}
+
+// ── Convert raw to voltage ────────────────────────────────
+static inline float raw_to_volts(int32_t raw) {
+    // ADS1263 full scale = ±VREF/GAIN for 32-bit signed
+    // LSB = 2*VREF / 2^32
+    return (float)raw * (2.0f * VREF) / (float)(1UL << 31);
+}
+
+// ── Shared memory setup ───────────────────────────────────
+static AdsShm *shm_create(void) {
+    int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) { perror("shm_open"); return NULL; }
+
+    ftruncate(fd, sizeof(AdsShm));
+
+    AdsShm *s = mmap(NULL, sizeof(AdsShm),
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, 0);
+    close(fd);
+
+    if (s == MAP_FAILED) { perror("mmap"); return NULL; }
+
+    memset(s, 0, sizeof(AdsShm));
+    atomic_init(&s->ch0_head, 0);
+    atomic_init(&s->ch1_head, 0);
+    atomic_init(&s->sample_count, 0);
+    atomic_init(&s->overruns, 0);
+    s->vref        = VREF;
+    s->sample_rate = SAMPLE_RATE;
+
+    return s;
+}
+
+// ── Main acquisition loop ─────────────────────────────────
+int main(void) {
+    signal(SIGINT,  sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    // GPIO
+    chip = gpiod_chip_open(GPIO_CHIP);
+    if (!chip) { perror("gpiod_chip_open"); return 1; }
+
+    drdy_line = gpiod_chip_get_line(chip, PIN_DRDY);
+    rst_line  = gpiod_chip_get_line(chip, PIN_RESET);
+
+    // DRDY: input, falling edge interrupt
+    gpiod_line_request_falling_edge_events(
+        drdy_line, "ads1263-drdy");
+
+    // RESET: output, default high
+    gpiod_line_request_output(rst_line, "ads1263-rst", 1);
+
+    // SPI: Mode 1 (CPOL=0, CPHA=1)
+    spi_fd = open(SPI_DEV, O_RDWR);
+    if (spi_fd < 0) { perror("open spi"); return 1; }
+
+    uint8_t mode  = SPI_MODE_1;
+    uint8_t bits  = 8;
+    uint32_t spd  = SPI_HZ;
+    ioctl(spi_fd, SPI_IOC_WR_MODE,          &mode);
+    ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
+    ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ,  &spd);
+
+    // Shared memory
+    shm = shm_create();
+    if (!shm) return 1;
+
+    // Init ADS1263
+    if (ads1263_init() < 0) return 1;
+
+    // RT setup — do last so init can use normal priority
+    setup_rt();
+
+    printf("Acquisition started — 2×1kHz\n");
+    printf("SHM: %s  |  Ctrl+C to stop\n", SHM_NAME);
+
+    // ── Mux cycle: CH0 → wait DRDY → read
+    //               CH1 → wait DRDY → read
+    //   At 2400SPS each channel settles in ~417µs
+    //   We alternate giving each channel ~500µs
+    int      current_ch = 0;
+    uint32_t total      = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    while (running) {
+        // Switch mux to next channel
+        if (current_ch == 0) {
+            write_reg(REG_INPMUX, MUX_CH0_AINCOM);
+        } else {
+            write_reg(REG_INPMUX, MUX_CH1_AINCOM);
+        }
+
+        // Restart conversion after mux change
+        spi_cmd(ADS1263_CMD_START1);
+
+        // Wait for DRDY (500ms timeout)
+        int ret = wait_drdy(500);
+        if (ret <= 0) {
+            fprintf(stderr, "DRDY timeout ch%d\n", current_ch);
+            current_ch ^= 1;
+            continue;
+        }
+
+        // Consume the DRDY event
+        struct gpiod_line_event evt;
+        gpiod_line_event_read(drdy_line, &evt);
+
+        // Read result
+        int32_t raw   = ads1263_read();
+        float   volts = raw_to_volts(raw);
+
+        // Push to shared memory ring buffer
+        if (current_ch == 0) {
+            unsigned h = atomic_load_explicit(
+                &shm->ch0_head, memory_order_relaxed);
+            shm->ch0[h % SHM_SAMPLES] = volts;
+            atomic_store_explicit(
+                &shm->ch0_head, h + 1,
+                memory_order_release);
+        } else {
+            unsigned h = atomic_load_explicit(
+                &shm->ch1_head, memory_order_relaxed);
+            shm->ch1[h % SHM_SAMPLES] = volts;
+            atomic_store_explicit(
+                &shm->ch1_head, h + 1,
+                memory_order_release);
+        }
+
+        total++;
+        atomic_store(&shm->sample_count, total);
+
+        // Print stats every 2000 samples (~1s)
+        if (total % 2000 == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double dt = (t1.tv_sec - t0.tv_sec) +
+                        (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+            printf("%.1f SPS/ch | overruns=%u\n",
+                   (total / 2.0) / dt,
+                   atomic_load(&shm->overruns));
+        }
+
+        current_ch ^= 1;  // toggle channel
+    }
+
+    // Cleanup
+    spi_cmd(ADS1263_CMD_STOP1);
+    gpiod_line_release(drdy_line);
+    gpiod_line_release(rst_line);
+    gpiod_chip_close(chip);
+    close(spi_fd);
+    munmap(shm, sizeof(AdsShm));
+    shm_unlink(SHM_NAME);
+
+    printf("Acquisition stopped. Total samples: %u\n", total);
+    return 0;
+
+
+}
