@@ -1,3 +1,38 @@
+"""
+Oscilloscope.py — PyQt6 + pyqtgraph oscilloscope UI for the ADS1263 ADC
+
+Architecture overview
+─────────────────────
+This UI runs entirely in the Qt main thread.  Two QTimers drive it:
+
+  • timer (250 ms)       — drains the POSIX shared memory ring buffer,
+                           applies gain offset and 50 Hz notch filter,
+                           then updates the waveform plot and statistics.
+
+  • _proc_poll_timer (500 ms) — checks whether the C acquisition daemon
+                           is still alive and lazily reconnects the SHM
+                           reader if the daemon restarted.
+
+Communication with the C daemon happens exclusively through the AdsShm
+struct in /ads1263 shared memory:
+
+  Python → C:  write a value to a cmd_* field; C polls it each DRDY cycle
+               and restores the sentinel (0xFF / 0xFFFFFFFF) when done.
+
+  C → Python:  C writes rb_* fields (register read-backs) and advances
+               pair0_head; Python reads samples by draining the ring buffer.
+
+50 Hz notch filter
+──────────────────
+iirnotch() produces a narrow-band IIR notch.  Its coefficients are
+computed in float64 but sosfiltfilt requires float64 input too — float32
+loses precision at high sample rates (coefficient −1.999967 ≈ −2.0 in
+float32), which wipes out the notch entirely.  The SOS (second-order
+sections) form is used instead of direct-form (b,a) for numerical
+stability.  Coefficients are cached per sample_rate to avoid recomputing
+them every 250 ms update frame.
+"""
+
 import collections
 import os
 import subprocess
@@ -11,7 +46,11 @@ _BINARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adc_oscillos
 
 class Oscilloscope(QtWidgets.QMainWindow):
 
+    # Plot refresh rate — 250 ms is fast enough to feel live while leaving
+    # enough CPU for the ring-buffer drain and filter computation.
     UPDATE_INTERVAL_MS = 250
+
+    # Rolling waveform window in samples (resizable via the dial).
     DISPLAY_SAMPLES    = 500
 
     def __init__(self):
@@ -22,7 +61,14 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self._proc = None
         self._abs_raw_min  = None
         self._abs_raw_max  = None
-        self._gain_offsets = {}   # {gain_reg: offset_volts}
+
+        # Per-gain software zero: {gain_reg_byte: offset_volts}.
+        # The ADS1263 PGA has an input-referred offset that scales with
+        # gain, so a separate zero is needed for each gain setting.
+        self._gain_offsets = {}
+
+        # Cached notch filter SOS coefficients and the sample rate they
+        # were computed for.  Recomputed only when sample_rate changes.
         self._notch_sos   = None
         self._notch_fs    = None
 
@@ -46,6 +92,9 @@ class Oscilloscope(QtWidgets.QMainWindow):
         left_layout.addWidget(QtWidgets.QLabel("<b>Sensor</b>"))
         left_layout.addSpacing(8)
         left_layout.addWidget(QtWidgets.QLabel("Sens. Exc. V:"))
+
+        # Bridge excitation voltage — used only to compute the µV/mmHg
+        # reference lines on the plot.  Does not affect ADC configuration.
         self.exc_voltage_spin = QtWidgets.QDoubleSpinBox()
         self.exc_voltage_spin.setRange(1.0, 10.0)
         self.exc_voltage_spin.setDecimals(3)
@@ -67,6 +116,9 @@ class Oscilloscope(QtWidgets.QMainWindow):
 
         left_layout.addSpacing(8)
         left_layout.addWidget(QtWidgets.QLabel("Vref:"))
+
+        # Manual Vref override for the raw-count → µV back-calculation in
+        # the Min/Max RAW display.  Does not affect the ADC hardware Vref.
         self.vref_spin = QtWidgets.QSpinBox()
         self.vref_spin.setRange(0, 5000)
         self.vref_spin.setSingleStep(1)
@@ -151,6 +203,9 @@ class Oscilloscope(QtWidgets.QMainWindow):
         ctrl_row2.addWidget(abs_clear_btn)
 
         ctrl_row2.addSpacing(12)
+
+        # Zero / Clr Zero: capture or clear the mean of the current window
+        # as a software offset for the currently selected gain setting.
         self.zero_btn = QtWidgets.QPushButton("Zero")
         self.zero_btn.setToolTip("Capture mean of current window as offset for the active gain")
         self.zero_btn.clicked.connect(self._on_zero)
@@ -206,6 +261,9 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self._avg_line.setVisible(False)
         self.pair0_plot.addItem(self._avg_line)
 
+        # Reference lines at ±1 mmHg / ±0.1 mmHg / ±0.01 mmHg from the mean.
+        # Sensor sensitivity is 5 µV/V of excitation per mmHg; the offset
+        # in volts is recomputed in _update_plot whenever avg changes.
         _yellow_dot  = pg.mkPen(color='y', style=QtCore.Qt.PenStyle.DotLine, width=1)
         _yellow_opts = {'position': 0.95, 'color': 'y', 'fill': (0, 0, 0, 120)}
         self._avg_upper_line = pg.InfiniteLine(angle=0, pen=_yellow_dot,
@@ -286,6 +344,8 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self.startstop_btn.clicked.connect(self._toggle_ads)
         sidebar_layout.addWidget(self.startstop_btn)
 
+        # Conversion start/stop: sends cmd_conv 0 or 1 to the C daemon.
+        # Disabled until the worker is running (enabled in _set_proc_running).
         self._conv_running = True
         self.conv_btn = QtWidgets.QPushButton("Stop Conv")
         self.conv_btn.setStyleSheet("background-color: #6a4a2d; color: white;")
@@ -299,6 +359,8 @@ class Oscilloscope(QtWidgets.QMainWindow):
         sidebar_layout.addWidget(self.proc_status_label)
 
         sidebar_layout.addSpacing(12)
+        # ADC Config group disabled until the worker is running to prevent
+        # writing to a non-existent SHM object.
         self.dr_group = QtWidgets.QGroupBox("ADC Config")
         self.dr_group.setEnabled(False)
         dr_layout = QtWidgets.QVBoxLayout(self.dr_group)
@@ -326,7 +388,7 @@ class Oscilloscope(QtWidgets.QMainWindow):
             ("×8",  0x30), ("×16", 0x40), ("×32", 0x50),
         ]:
             self.gain_combo.addItem(label, reg)
-        self.gain_combo.setCurrentIndex(5)   # ×32 matches ADC_GAIN default
+        self.gain_combo.setCurrentIndex(5)   # ×32 matches ADC_GAIN default in ads1263.h
         self.gain_combo.activated.connect(self._on_gain_changed)
         dr_layout.addWidget(self.gain_combo)
 
@@ -337,13 +399,14 @@ class Oscilloscope(QtWidgets.QMainWindow):
             ("SINC1", 0), ("SINC2", 1), ("SINC3", 2), ("SINC4", 3), ("FIR", 4),
         ]:
             self.filter_combo.addItem(label, idx)
-        self.filter_combo.setCurrentIndex(3)   # SINC4 matches ADC_FILTER default
+        self.filter_combo.setCurrentIndex(3)   # SINC4 matches ADC_FILTER default in ads1263.h
         self.filter_combo.activated.connect(self._on_filter_changed)
         dr_layout.addWidget(self.filter_combo)
 
         dr_layout.addSpacing(4)
         dr_layout.addWidget(QtWidgets.QLabel("Reference:"))
-        # REFMUX bits[5:3]=RMUXP, bits[2:0]=RMUXN
+        # REFMUX register: bits[5:3] = RMUXP, bits[2:0] = RMUXN.
+        # The combo item data is the 3-bit field value (0–4), not the full byte.
         _refp_pins = [
             ("Internal", 0), ("AIN0", 1), ("AIN2", 2), ("AIN4", 3), ("AVDD", 4),
         ]
@@ -373,6 +436,7 @@ class Oscilloscope(QtWidgets.QMainWindow):
 
         dr_layout.addSpacing(4)
         dr_layout.addWidget(QtWidgets.QLabel("Input MUX:"))
+        # INPMUX register: bits[7:4] = MUXP, bits[3:0] = MUXN.
         _mux_pins = [
             ("AIN0", 0x0), ("AIN1", 0x1), ("AIN2", 0x2), ("AIN3", 0x3),
             ("AIN4", 0x4), ("AIN5", 0x5), ("AIN6", 0x6), ("AIN7", 0x7),
@@ -401,12 +465,16 @@ class Oscilloscope(QtWidgets.QMainWindow):
         sidebar_layout.addWidget(self.dr_group)
 
         # ── ADC Register group ────────────────────────────────
+        # Allows reading and writing any of the five key ADS1263 registers
+        # directly.  Reads are polled from the rb_* SHM fields (populated by
+        # the C daemon after each write and at startup).  Writes go through
+        # cmd_raw_wreg: a single uint32 packing (addr << 8) | val.
         self.reg_group = QtWidgets.QGroupBox("ADC Register")
         reg_layout = QtWidgets.QVBoxLayout(self.reg_group)
         reg_layout.setContentsMargins(4, 4, 4, 4)
         reg_layout.setSpacing(2)
 
-        # (name, register address, SHM read-back attribute)
+        # (name, register address, SHM read-back attribute name)
         _regs = [
             ("MODE0",  0x03, "rb_mode0"),
             ("MODE1",  0x04, "rb_mode1"),
@@ -446,14 +514,18 @@ class Oscilloscope(QtWidgets.QMainWindow):
         # ── Timers ────────────────────────────────────────────
         self.frozen = False
 
+        # Main plot update timer — drains SHM ring buffer and redraws.
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self._update_plot)
         self.timer.start(self.UPDATE_INTERVAL_MS)
 
+        # Process health check — also retries SHM connect if reader is None.
         self._proc_poll_timer = QtCore.QTimer()
         self._proc_poll_timer.timeout.connect(self._poll_proc)
         self._proc_poll_timer.start(500)
 
+        # Single-shot debounce for the window-size dial: avoids reallocating
+        # the deque on every tick while the user is spinning the dial.
         self._resize_timer = QtCore.QTimer()
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._apply_window_resize)
@@ -461,6 +533,12 @@ class Oscilloscope(QtWidgets.QMainWindow):
     # ── Shared memory connection ─────────────────────────────
 
     def _try_connect_shm(self) -> bool:
+        """Lazily open the SHM object.
+
+        The C daemon may start after this UI or restart mid-session, so
+        every plot update attempts to connect if the reader is not yet open.
+        Returns True if connected (new or existing), False if unavailable.
+        """
         if self.shm_reader is not None:
             return True
         try:
@@ -505,6 +583,7 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self._set_proc_running(False)
 
     def _poll_proc(self):
+        """Check if the daemon exited; also retry SHM connect when idle."""
         if self._proc and self._proc.poll() is not None:
             code = self._proc.returncode
             self._proc = None
@@ -512,6 +591,8 @@ class Oscilloscope(QtWidgets.QMainWindow):
             self._set_proc_running(False)
             self.proc_status_label.setText(f"Exited ({code})")
         elif self._proc is None:
+            # No daemon running — try to connect in case one was started
+            # externally (e.g. from a terminal or systemd unit).
             self._try_connect_shm()
 
     def _set_proc_running(self, running: bool):
@@ -524,9 +605,15 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self.dr_group.setEnabled(running)
         self.conv_btn.setEnabled(running)
         if not running:
+            # Reset conv state so the button label is correct next time the
+            # worker starts (the C daemon always starts with conversions on).
             self._conv_running = True
             self.conv_btn.setText("Stop Conv")
             self.conv_btn.setStyleSheet("background-color: #6a4a2d; color: white;")
+
+    # ── ADC command senders ───────────────────────────────────
+    # Each method writes a value to a cmd_* SHM field.  The C daemon polls
+    # these fields once per DRDY cycle and restores the sentinel on apply.
 
     def _on_dr_changed(self, idx):
         if self.shm_reader is None:
@@ -541,6 +628,7 @@ class Oscilloscope(QtWidgets.QMainWindow):
     def _on_refmux_changed(self, _idx=None):
         if self.shm_reader is None:
             return
+        # Reconstruct the REFMUX byte: bits[5:3]=RMUXP, bits[2:0]=RMUXN.
         refp = self.refp_combo.currentData()
         refn = self.refn_combo.currentData()
         self.shm_reader.shm.cmd_refmux = (refp << 3) | refn
@@ -548,6 +636,7 @@ class Oscilloscope(QtWidgets.QMainWindow):
     def _on_inpmux_changed(self, _idx=None):
         if self.shm_reader is None:
             return
+        # Reconstruct the INPMUX byte: bits[7:4]=MUXP, bits[3:0]=MUXN.
         muxp = self.muxp_combo.currentData()
         muxn = self.muxn_combo.currentData()
         self.shm_reader.shm.cmd_inpmux = (muxp << 4) | muxn
@@ -558,6 +647,7 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self.shm_reader.shm.cmd_filter = self.filter_combo.itemData(idx)
 
     def _toggle_conv(self):
+        """Send START1 (1) or STOP1 (0) to the C daemon via cmd_conv."""
         if self.shm_reader is None:
             return
         self._conv_running = not self._conv_running
@@ -569,20 +659,25 @@ class Oscilloscope(QtWidgets.QMainWindow):
         )
 
     def _on_raw_wreg(self, addr: int, val: int):
+        """Pack (addr << 8) | val into cmd_raw_wreg for a direct register write."""
         if self.shm_reader is None:
             return
         self.shm_reader.shm.cmd_raw_wreg = (addr << 8) | (val & 0xFF)
 
     def _refresh_regs(self):
+        """Read rb_* fields from SHM and update the register panel labels."""
         if self.shm_reader is None:
             return
         shm = self.shm_reader.shm
         for _addr, rb_attr, val_lbl, spin in self._reg_rows:
+            # rb_attr is a string like "rb_mode0" — getattr avoids a long
+            # if/elif chain for each register.
             v = getattr(shm, rb_attr) & 0xFF
             val_lbl.setText(f"0x{v:02X}")
             spin.setValue(v)
 
     def _sync_dr_combo(self):
+        """Select the combo entry that matches the current hardware sample rate."""
         if self.shm_reader is None:
             return
         sps = self.shm_reader.shm.sample_rate
@@ -600,15 +695,27 @@ class Oscilloscope(QtWidgets.QMainWindow):
             if not self.frozen:
                 self._buf.extend(self.shm_reader.drain_pair0())
 
+                # Guard against the brief window after worker start where
+                # sample_rate is still 0 (not yet written by the C daemon).
                 sample_rate = self.shm_reader.shm.sample_rate or 100
                 window_s = self._buf.maxlen / sample_rate
                 self.pair0_plot.setXRange(0, window_s, padding=0)
                 if self._buf:
                     data = np.array(self._buf, dtype=np.float32)
+
+                    # Subtract per-gain software zero offset before filtering
+                    # so the filter operates on zero-centred data.
                     gain_reg = self.gain_combo.currentData()
                     gain_off = self._gain_offsets.get(gain_reg, 0.0)
                     if gain_off != 0.0:
                         data = data - np.float32(gain_off)
+
+                    # 50 Hz notch filter (IIR, second-order sections).
+                    # Requires float64: at high sample rates the iirnotch
+                    # coefficient is ≈ −2.0; float32 cannot represent the
+                    # difference from −2.0 precisely enough and the notch
+                    # disappears.  Cast back to float32 for the rest of the
+                    # pipeline to avoid unnecessary memory use.
                     if self.notch_50hz_chk.isChecked() and sample_rate > 100:
                         if self._notch_fs != sample_rate:
                             b, a = iirnotch(50.0, 30.0, float(sample_rate))
@@ -622,6 +729,10 @@ class Oscilloscope(QtWidgets.QMainWindow):
                                 ).astype(np.float32)
                             except Exception:
                                 pass
+
+                    # Right-align samples: when the buffer is not yet full
+                    # the oldest sample sits at the right edge of the window,
+                    # offset by (maxlen - len) sample intervals.
                     t = (np.arange(len(data)) + (self._buf.maxlen - len(data))) / sample_rate
                     self.pair0_curve.setData(t, data)
 
@@ -634,6 +745,7 @@ class Oscilloscope(QtWidgets.QMainWindow):
                         self.avg_label.setText(f"{avg:.6f} V")
                     if self.avg_line_chk.isChecked():
                         self._avg_line.setValue(avg)
+                        # 1 mmHg sensitivity = 5 µV/V × excitation voltage.
                         offset = self.exc_voltage_spin.value() * 5e-6
                         self._avg_upper_line.setValue(avg + offset)
                         self._avg_lower_line.setValue(avg - offset)
@@ -659,6 +771,9 @@ class Oscilloscope(QtWidgets.QMainWindow):
                         self.vpp_label.setText("—")
 
                     if self.lsb_chk.isChecked():
+                        # Back-convert voltage to raw 32-bit counts so the
+                        # user can see the noise floor in ADC codes (LSBs).
+                        # raw = volts × gain_factor × 2^31 / Vref
                         gain_reg = self.gain_combo.currentData()
                         gain_factor = 1 << (gain_reg >> 4)
                         refmux_byte = (self.refp_combo.currentData() << 3) | self.refn_combo.currentData()
@@ -716,6 +831,8 @@ class Oscilloscope(QtWidgets.QMainWindow):
             self.status_label.setText(f"Error: {e}")
 
     def _on_exc_voltage_changed(self, v):
+        # Typical pressure sensor sensitivity: 5 µV/V of excitation per mmHg.
+        # These labels show the expected ADC signal for 1 / 0.1 / 0.01 mmHg.
         s1   = v * 5.0          # µV  — 1 mmHg
         s01  = v * 0.5          # µV  — 0.1 mmHg
         s001 = v * 0.05         # µV  — 0.01 mmHg
@@ -783,6 +900,8 @@ class Oscilloscope(QtWidgets.QMainWindow):
 
     def _on_samples_changed(self, value):
         self.samples_val_label.setText(f"{value} smp")
+        # Debounce: defer the actual deque reallocation by 150 ms so we
+        # don't allocate on every intermediate dial tick while the user spins.
         self._resize_timer.start(150)
 
     def _apply_window_resize(self):
@@ -800,9 +919,11 @@ class Oscilloscope(QtWidgets.QMainWindow):
             self.lsb_label.setText("—")
 
     def _on_zero(self):
+        """Capture the mean of the current window as the offset for the active gain."""
         if not self._buf:
             return
         gain_reg = self.gain_combo.currentData()
+        # Use float64 for the mean to avoid accumulated float32 rounding error.
         off = float(np.mean(np.array(self._buf, dtype=np.float64)))
         self._gain_offsets[gain_reg] = off
         if abs(off) < 1e-3:
@@ -823,6 +944,8 @@ class Oscilloscope(QtWidgets.QMainWindow):
         self._abs_raw_max = None
         self.lsb_label.setText("—")
         self.pair0_curve.setData([], [])
+        # Also fast-forward the SHM tail to the current head so we don't
+        # re-consume samples that were already displayed before the clear.
         shm = self.shm_reader.shm
         shm.pair0_tail = shm.pair0_head
         shm.pair0_lost = 0
