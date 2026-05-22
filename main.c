@@ -14,10 +14,6 @@
 #include "ads1263.h"
 #include "sharedMemory.h"
 
-#ifdef USE_DMA
-#include "rp1_dma.h"
-#endif
-
 // ── Hardware config ──────────────────────────────────────
 #define GPIO_CHIP     "/dev/gpiochip4"
 
@@ -33,10 +29,6 @@ static volatile int running = 1;
 static struct gpiod_chip         *pChip     = NULL;
 static struct gpiod_line_request *drdy_req  = NULL;
 static AdsShm                    *shm       = NULL;
-
-#ifdef USE_DMA
-static rp1_dma_t                 *dma       = NULL;
-#endif
 
 /** LOCAL FUNCTION PROTOTYPES */
 static int8_t wait_drdy(int timeout_ms);
@@ -80,12 +72,6 @@ int main(void){
 
     // ADS1263 — configure registers via spidev, then hand off SPI to DMA
     if (ads1263_init(pChip)) { perror("ads1263_init"); return 1; }
-
-#ifdef USE_DMA    
-    // RP1 DMA — takes over SPI0 hardware after ads1263_init closes spidev
-    dma = rp1_dma_open(RP1_DREQ_SPI0_RX, RP1_DREQ_SPI0_TX);
-    if (!dma) { fprintf(stderr, "rp1_dma_open failed\n"); return 1; }
-#endif
 
     // Shared memory
     shm = shm_create();
@@ -200,18 +186,6 @@ int main(void){
             atomic_store_explicit(&shm->pair0_tail, (tail + 1) % SHM_SAMPLES, memory_order_relaxed);
         }
 
-#ifdef USE_DMA
-        // DMA read: CMD_RDATA1 + 4 data bytes + 1 status = 6 bytes
-        // TX: [RDATA1, 0, 0, 0, 0, 0]  RX: [x, STATUS, D3, D2, D1, D0]
-        static const uint8_t tx[6] = { 0x12, 0, 0, 0, 0, 0 };
-        uint8_t rx[6] = {0};
-        if (rp1_dma_spi_transfer(dma, tx, rx, sizeof(tx)) < 0) continue;
-
-        int32_t raw = (int32_t)((uint32_t)rx[2] << 24 |
-                                (uint32_t)rx[3] << 16 |
-                                (uint32_t)rx[4] <<  8 |
-                                (uint32_t)rx[5]);
-#endif
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         long elapsed_us = (t1.tv_sec  - t0.tv_sec)  * 1000000L
@@ -244,9 +218,6 @@ int main(void){
     gpiod_edge_event_buffer_free(evbuf);
     gpiod_line_request_release(drdy_req);
     ads1263_deinit();
-#ifdef USE_DMA
-    rp1_dma_close(dma);
-#endif
     gpiod_chip_close(pChip);
 
     if (shm) {
